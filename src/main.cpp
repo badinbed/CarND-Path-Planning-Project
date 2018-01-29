@@ -16,10 +16,16 @@ using namespace Eigen;
 // for convenience
 using json = nlohmann::json;
 
-// For converting back and forth between radians and degrees.
+// constants and helper functions
+const int num_lanes = 3;
+const double max_s = 6945.554;
+
 constexpr double pi() { return M_PI; }
 double deg2rad(double x) { return x * pi() / 180; }
 double rad2deg(double x) { return x * 180 / pi(); }
+double mph2ms(double mph) { return mph/2.24; }
+double ms2mph(double ms) { return ms*2.24; }
+int d2lane(double d) { return static_cast<int>((d - 2.0) / 4.0 + 0.5); }
 
 // Checks if the SocketIO event has JSON data.
 // If there is data the JSON object in string format will be returned,
@@ -35,6 +41,105 @@ string hasData(string s) {
   }
   return "";
 }
+
+class Vehicle {
+    enum SensorFusionId {
+        eId = 0,
+        eX = 1,
+        eY = 2,
+        eDX = 3,
+        eDY = 4,
+        eS = 5,
+        eD = 6,
+    };
+
+public:
+    Vehicle()
+        : m_is_valid(false)
+        , m_lane(-1)
+        , m_s(0)
+        , m_x(0)
+        , m_y(0)
+        , m_dx(0)
+        , m_dy(0)
+        , m_speed(0)
+    {
+    }
+
+    Vehicle(const vector<double>& sf_item)
+        : m_is_valid(true)
+        , m_lane(d2lane(sf_item[eD]))
+        , m_s(sf_item[eS])
+        , m_x(sf_item[eX])
+        , m_y(sf_item[eY])
+        , m_dx(sf_item[eDX])
+        , m_dy(sf_item[eDY]) {
+        m_speed = sqrt(m_dx*m_dx + m_dy*m_dy);
+    }
+
+    bool isValid() const { return m_is_valid; }
+    double getS() const { return m_s; }
+    double getProjectedS(double secs_look_ahead) const { return m_s + secs_look_ahead * m_speed; }
+    double getRelativeS(double rs, double secs_look_ahead = 0.0) const {
+        double projected_s = getProjectedS(secs_look_ahead);
+        double ds = projected_s - rs;
+        if(abs(ds) > max_s * 0.5) {
+            if( ds > 0)
+                ds -= max_s;
+            else
+                ds += max_s;
+        }
+        return ds;
+    }
+    double getVelocity() const { return m_speed; }
+    int getLane() const { return m_lane; }
+
+private:
+    bool m_is_valid;
+    int m_lane;
+    double m_s;
+    double m_x;
+    double m_y;
+    double m_dx;
+    double m_dy;
+    double m_speed;
+};
+
+class VehicleMap {
+public:
+    VehicleMap(const vector<vector<double>>& sensor_fusion, int num_lanes)
+        : m_lanes(num_lanes) {
+
+        // sort all vehicles by lane
+        for(int i = 0; i < sensor_fusion.size(); ++i) {
+            Vehicle v(sensor_fusion[i]);
+            if(v.getLane() >= 0 && v.getLane() < num_lanes)
+                m_lanes[v.getLane()].push_back(v);
+            else
+                cout << "ignored vehicle " << i << endl;
+        }
+    }
+
+    const vector<Vehicle> & getLane(int i) const {
+        return m_lanes[i];
+    }
+
+    vector<double> calculateLaneSpeeds(double ref_s, double target_vel, double secs_look_ahead = 0.0) const {
+
+        vector<double> lane_speeds(m_lanes.size(), target_vel);
+        for(int lane = 0; lane < m_lanes.size(); ++lane) {
+            for(auto v = m_lanes[lane].begin(); v != m_lanes[lane].end(); ++v) {
+                if(v->getRelativeS(ref_s, secs_look_ahead) >= 0) {
+                    lane_speeds[lane] = std::min(lane_speeds[lane], ms2mph(v->getVelocity()));
+                }
+            }
+        }
+        return lane_speeds;
+    }
+
+private:
+    vector<vector<Vehicle>> m_lanes;
+};
 
 double distance(double x1, double y1, double x2, double y2)
 {
@@ -167,14 +272,6 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
-double mphToMs(double mph) {
-    return mph/2.24;
-}
-
-double msToMph(double ms) {
-    return ms*2.24;
-}
-
 void caluclateEffectiveLaneSpeeds(vector<double>& out_lane_speeds, const vector<vector<double>>& sensor_fusion, double ref_s, double seconds_look_ahead, double safety_distance) {
     for(int object_id = 0; object_id < sensor_fusion.size(); ++object_id) {
         auto& object = sensor_fusion[object_id];
@@ -188,14 +285,13 @@ void caluclateEffectiveLaneSpeeds(vector<double>& out_lane_speeds, const vector<
         object_s += seconds_look_ahead * object_speed;
 
         if(object_s > ref_s - safety_distance) {
-            out_lane_speeds[object_lane] = min(msToMph(object_speed), out_lane_speeds[object_lane]);
+            out_lane_speeds[object_lane] = min(ms2mph(object_speed), out_lane_speeds[object_lane]);
         }
     }
 }
 
-void calculateEfficiencyCost(vector<double>& out_cost, const vector<double>& lane_speeds, int ref_lane, double target_speed) {
-   int num_lanes = lane_speeds.size();
-    out_cost.resize(num_lanes);
+vector<double> calculateEfficiencyCost(const vector<double>& lane_speeds, int ref_lane, double target_speed) {
+    vector<double> out_cost(num_lanes, 0.0);
     double max_lane_speed = 0;
     int fastest_lane = numeric_limits<int>::max();
     for(int i = 0; i < num_lanes; ++i) {
@@ -218,31 +314,26 @@ void calculateEfficiencyCost(vector<double>& out_cost, const vector<double>& lan
             out_cost[i] = (out_cost[i] + d_cost);
         }
     }
+    return out_cost;
 }
 
-void calculateSafetyCost(vector<double>& out_safety_cost, const vector<vector<double>>& sensor_fusion, int ref_lane, double ref_s, double seconds_look_ahead, double safety_distance) {
-    out_safety_cost.resize(3, 0.0);
-    for(int i = 0; i < 3; ++i) {
-        if(abs(i - ref_lane) > 1)
-           out_safety_cost[i] = 1.0;
-    }
-    safety_distance *= 0.7;
-    for(int object_id = 0; object_id < sensor_fusion.size(); ++object_id) {
-        auto& object = sensor_fusion[object_id];
-        double object_d = object[6];
-        int object_lane = static_cast<int>((object_d - 2.0) / 4.0 + 0.5);
-        if(abs(object_lane - ref_lane) == 1) {
-            double object_s = object[5];
-            double object_vx = object[3];
-            double object_vy = object[4];
-            double object_speed = sqrt(object_vx*object_vx + object_vy*object_vy);
-            object_s += seconds_look_ahead * object_speed;
-
-            if(object_s + safety_distance > ref_s && object_s - safety_distance < ref_s) {
-                out_safety_cost[object_lane] = 1.0;
+vector<double> calculateSafetyCost(const VehicleMap& vehicle_map, int ref_lane, double ref_s, double seconds_look_ahead, double safety_distance) {
+    vector<double> safety_cost(num_lanes, 0.0);
+    for(int i = 0; i < num_lanes; ++i) {
+        if(abs(i - ref_lane) > 1) {
+           safety_cost[i] = 1.0;
+        } else {
+            auto& lane = vehicle_map.getLane(i);
+            for(auto v = lane.begin(); v != lane.end(); ++v) {
+                double v_s = v->getProjectedS(seconds_look_ahead);
+                if(v_s + safety_distance > ref_s && v_s - safety_distance < ref_s) {
+                    safety_cost[i] = 1.0;
+                }
             }
         }
     }
+
+    return safety_cost;
 }
 
 int main() {
@@ -258,7 +349,6 @@ int main() {
   // Waypoint map to read from
   string map_file_ = "../data/highway_map.csv";
   // The max s value before wrapping around the track back to 0
-  double max_s = 6945.554;
 
   ifstream in_map_(map_file_.c_str(), ifstream::in);
 
@@ -319,17 +409,14 @@ int main() {
             // Previous path data given to the Planner
             auto previous_path_x = j[1]["previous_path_x"];
             auto previous_path_y = j[1]["previous_path_y"];
+             int prev_size = previous_path_x.size();
             // Previous path's end s and d values
             double end_path_s = j[1]["end_path_s"];
             double end_path_d = j[1]["end_path_d"];
 
             // Sensor Fusion Data, a list of all other cars on the same side of the road.
             vector<vector<double>> sensor_fusion = j[1]["sensor_fusion"];
-
-            int prev_size = previous_path_x.size();
-
-            static int counter = 0;
-
+            VehicleMap vehicle_map(sensor_fusion, num_lanes);
 
 
             vector<double> ptsx, ptsy;
@@ -338,38 +425,20 @@ int main() {
             double ref_y = car_y;
             double ref_yaw = deg2rad(car_yaw);
             double ref_s = prev_size > 0 ? end_path_s : car_s;
-            bool too_close = false;
-            double close_object_speed;
-            double close_object_s = numeric_limits<double>::max();
 
 
-            if(++counter % 50 == 0) {
+            // check for viable lane switch every second
+            static int frame_counter = 0;
+            if(++frame_counter % 50 == 0) {
 
-                double min_s = numeric_limits<double>::max();
-                double max_s = numeric_limits<double>::min();
-                for(int i = 0; i < sensor_fusion.size(); ++i) {
-                    double s = sensor_fusion[i][5];
-                    min_s = std::min(min_s, s);
-                    max_s = std::max(max_s, s);
-                }
-                cout << "sensor s: " << min_s << "  " << car_s << "  " << max_s << endl;
-                vector<double> lane_speeds(3, target_vel);
-                caluclateEffectiveLaneSpeeds(lane_speeds, sensor_fusion, ref_s, prev_size/50.0, safety_distance);
-                char buffer[300];
-                sprintf(buffer,"lane speeds: %4.2f  |  %4.2f  |  %4.2f", lane_speeds[0], lane_speeds[1], lane_speeds[2]);
-                cout << buffer << endl;
+                auto lane_speeds = vehicle_map.calculateLaneSpeeds(ref_s, target_vel, prev_size/50.0);
+                fprintf(stdout,"lane speeds: %4.2f  |  %4.2f  |  %4.2f", lane_speeds[0], lane_speeds[1], lane_speeds[2]);
 
-                vector<double> lane_costs;
-                calculateEfficiencyCost(lane_costs, lane_speeds, ref_lane, target_vel);
-                memset(buffer, 300, 0);
-                sprintf(buffer,"lane costs:  %4.2f  |  %4.2f  |  %4.2f", lane_costs[0], lane_costs[1], lane_costs[2]);
-                cout << buffer << endl;
+                vector<double> lane_costs = calculateEfficiencyCost(lane_speeds, ref_lane, target_vel);
+                fprintf(stdout,"lane costs:  %4.2f  |  %4.2f  |  %4.2f", lane_costs[0], lane_costs[1], lane_costs[2]);
 
-                vector<double> safety_costs;
-                calculateSafetyCost(safety_costs, sensor_fusion, ref_lane, ref_s, prev_size/50.0, safety_distance);
-                memset(buffer, 300, 0);
-                sprintf(buffer,"safe costs:  %4.2f  |  %4.2f  |  %4.2f", safety_costs[0], safety_costs[1], safety_costs[2]);
-                cout << buffer << endl;
+                vector<double> safety_costs = calculateSafetyCost(vehicle_map, ref_lane, ref_s, prev_size/50.0, safety_distance);
+                fprintf(stdout,"safe costs:  %4.2f  |  %4.2f  |  %4.2f", safety_costs[0], safety_costs[1], safety_costs[2]);
 
                 int min_cost_lane = ref_lane;
                 double min_cost = numeric_limits<double>::max();
@@ -388,33 +457,14 @@ int main() {
                 cout << endl;
             }
 
-            for(int object_id = 0; object_id < sensor_fusion.size(); ++object_id) {
-                auto& object = sensor_fusion[object_id];
-                double object_d = object[6];
-                int object_lane = static_cast<int>((object_d - 2.0) / 4.0 + 0.5);
-
-                if(object_lane == ref_lane) {
-                    double object_s = object[5];
-                    double object_vx = object[3];
-                    double object_vy = object[4];
-                    double object_speed = sqrt(object_vx*object_vx + object_vy*object_vy);
-                    object_s += prev_size * 0.02 * object_speed;
-
-                    if(object_s > ref_s) {
-                        double object_distance = object_s - ref_s;
-                        //cout << "object distance = " << object_distance << endl;
-                        if(object_distance < safety_distance) {
-                            too_close = true;
-                            if(object_s < close_object_s) {
-                                close_object_s = object_s;
-                                close_object_speed = object_speed;
-                            }
-                        }
-
-                    }
+            Vehicle closest_vehicle;
+            auto& lane = vehicle_map.getLane(ref_lane);
+            for(auto v = lane.begin(); v != lane.end(); ++v) {
+                double relative_s = v->getRelativeS(ref_s, prev_size/50.0);
+                if(relative_s > 0 && relative_s < safety_distance) {
+                    closest_vehicle = *v;
                 }
             }
-
 
 
 
@@ -476,9 +526,9 @@ int main() {
 
             double projected_ref_s = ref_s;
             for(int i = 0; i < horizon - prev_size; ++i) {
-                if(too_close) {
-                    double projected_object_s = close_object_s + (prev_size + i) * 0.02 * close_object_speed;
-                    if(projected_ref_s > projected_object_s - safety_distance)
+                if(closest_vehicle.isValid()) {
+                    double rel_s = closest_vehicle.getRelativeS(projected_ref_s, (prev_size + i) / 50.0);
+                    if(rel_s < safety_distance)
                         ref_vel = std::max(ref_vel - 0.3, 0.0);
                     else
                         ref_vel = std::min(ref_vel + 0.1, target_vel);
@@ -486,7 +536,7 @@ int main() {
                     ref_vel = std::min(ref_vel + 0.224, target_vel);
                 }
 
-                double frame_vel = 0.02 * mphToMs(ref_vel);
+                double frame_vel = 0.02 * mph2ms(ref_vel);
                 projected_ref_s += frame_vel;
                 double N = target_dist / frame_vel;
                 double x_point = x_add_on + target_x / N;
