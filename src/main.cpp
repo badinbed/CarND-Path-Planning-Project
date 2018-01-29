@@ -42,7 +42,9 @@ string hasData(string s) {
   return "";
 }
 
+// Stores basic information from sensor fusion per vehicle
 class Vehicle {
+    // indices into sensor fusion object vector
     enum SensorFusionId {
         eId = 0,
         eX = 1,
@@ -77,9 +79,22 @@ public:
         m_speed = sqrt(m_dx*m_dx + m_dy*m_dy);
     }
 
+    // returns true if this object was constructed from sensor fusion data
+    // false if it was constructed by default
+    // would be nice to have std::optional from c++17 available instead
     bool isValid() const { return m_is_valid; }
+
+    // returns the current s-value for this vehicle (frenet)
     double getS() const { return m_s; }
+
+    // returns the estimated s-value of this vehicle insecs_look_ahead seconds
+    // assuming its current velocity won't change
     double getProjectedS(double secs_look_ahead) const { return m_s + secs_look_ahead * m_speed; }
+
+    // returns the relative s-value of the vehicle given a reference point rs and projection
+    // time frame secs_look_ahead.
+    // this function consideres the map wrap around at max_s
+    // if the return value is larger than 0 the vehicle is ahead of rs, otherwise behind
     double getRelativeS(double rs, double secs_look_ahead = 0.0) const {
         double projected_s = getProjectedS(secs_look_ahead);
         double ds = projected_s - rs;
@@ -91,7 +106,11 @@ public:
         }
         return ds;
     }
+
+    // returns the vehicle's current velocity in m/s
     double getVelocity() const { return m_speed; }
+
+    // returns the vehicles lane
     int getLane() const { return m_lane; }
 
 private:
@@ -105,8 +124,10 @@ private:
     double m_speed;
 };
 
+// organizes sensor fusion into vehicles assigned to their respective lanes
 class VehicleMap {
 public:
+
     VehicleMap(const vector<vector<double>>& sensor_fusion, int num_lanes)
         : m_lanes(num_lanes) {
 
@@ -115,15 +136,17 @@ public:
             Vehicle v(sensor_fusion[i]);
             if(v.getLane() >= 0 && v.getLane() < num_lanes)
                 m_lanes[v.getLane()].push_back(v);
-            else
-                cout << "ignored vehicle " << i << endl;
         }
     }
 
+    // returns an unordered vector of vehicles for the given lane i
     const vector<Vehicle> & getLane(int i) const {
         return m_lanes[i];
     }
 
+    // calculates the effective speed of a lane given a reference point ref_s
+    // the effective speed is the speed velocity of the slowest vehicle in a lane in front of ref_s
+    // secs_look_ahead can be used to project the vehclies into their future positions
     vector<double> calculateLaneSpeeds(double ref_s, double target_vel, double secs_look_ahead = 0.0) const {
 
         vector<double> lane_speeds(m_lanes.size(), target_vel);
@@ -272,34 +295,25 @@ vector<double> getXY(double s, double d, const vector<double> &maps_s, const vec
 
 }
 
-void caluclateEffectiveLaneSpeeds(vector<double>& out_lane_speeds, const vector<vector<double>>& sensor_fusion, double ref_s, double seconds_look_ahead, double safety_distance) {
-    for(int object_id = 0; object_id < sensor_fusion.size(); ++object_id) {
-        auto& object = sensor_fusion[object_id];
-        double object_d = object[6];
-        int object_lane = static_cast<int>((object_d - 2.0) / 4.0 + 0.5);
-
-        double object_s = object[5];
-        double object_vx = object[3];
-        double object_vy = object[4];
-        double object_speed = sqrt(object_vx*object_vx + object_vy*object_vy);
-        object_s += seconds_look_ahead * object_speed;
-
-        if(object_s > ref_s - safety_distance) {
-            out_lane_speeds[object_lane] = min(ms2mph(object_speed), out_lane_speeds[object_lane]);
-        }
-    }
-}
-
+// cost function to calculate the efficiency cost per lane
+// the cost is within the closed interval [0, 1]
+// lane speed, lane change and distance from the optimal lane effect this cost
 vector<double> calculateEfficiencyCost(const vector<double>& lane_speeds, int ref_lane, double target_speed) {
     vector<double> out_cost(num_lanes, 0.0);
+
+    // initialize lane costs by their current lane speed scaled by the inverse target_speed
+    // the lane speeds are clipped at [0, target_speed], thus the cost will be in [0, 1].
+    // Also the fastest/desired lane is noted.
+    // A lane that is not the reference lane is slightly penalized to avoid switching lanes for minimal to no gains
     double max_lane_speed = 0;
     int fastest_lane = numeric_limits<int>::max();
     for(int i = 0; i < num_lanes; ++i) {
+        // save the fastest lane. If more than one lane is the fastest, the closest to the reference lane will be saved
         if(lane_speeds[i] > max_lane_speed || (max_lane_speed == lane_speeds[i] && abs(fastest_lane - ref_lane) > abs(i - ref_lane))) {
             max_lane_speed = lane_speeds[i];
             fastest_lane = i;
         }
-        double lane_change_cost = i == ref_lane ? 0.0 : 2.0;
+        double lane_change_cost = i == ref_lane ? 0.0 : 2.0; // penalize lane switches
         out_cost[i] = (lane_change_cost + target_speed - lane_speeds[i]) / (target_speed+2.0);
     }
 
@@ -317,6 +331,10 @@ vector<double> calculateEfficiencyCost(const vector<double>& lane_speeds, int re
     return out_cost;
 }
 
+// Binary cost function to calculate the safety for possible lane switches.
+// The cost for for the reference lane is always 0 because there is no switch needed
+// The cost for a lane further away then one lane switch is always 1 to avoid jumping lanes directly
+// THe cost for a direct neighboring lane is 0 if there is a gap the car will safely fit into, otherwise it is 1.
 vector<double> calculateSafetyCost(const VehicleMap& vehicle_map, int ref_lane, double ref_s, double seconds_look_ahead, double safety_distance) {
     vector<double> safety_cost(num_lanes, 0.0);
     for(int i = 0; i < num_lanes; ++i) {
@@ -419,8 +437,7 @@ int main() {
             VehicleMap vehicle_map(sensor_fusion, num_lanes);
 
 
-            vector<double> ptsx, ptsy;
-
+            // reference data for the ego vehicle
             double ref_x = car_x;
             double ref_y = car_y;
             double ref_yaw = deg2rad(car_yaw);
@@ -432,17 +449,18 @@ int main() {
             if(++frame_counter % 50 == 0) {
 
                 auto lane_speeds = vehicle_map.calculateLaneSpeeds(ref_s, target_vel, prev_size/50.0);
-                fprintf(stdout,"lane speeds: %4.2f  |  %4.2f  |  %4.2f", lane_speeds[0], lane_speeds[1], lane_speeds[2]);
+                fprintf(stdout,"lane speeds: %5.2f  |  %5.2f  |  %5.2f\n", lane_speeds[0], lane_speeds[1], lane_speeds[2]);
 
                 vector<double> lane_costs = calculateEfficiencyCost(lane_speeds, ref_lane, target_vel);
-                fprintf(stdout,"lane costs:  %4.2f  |  %4.2f  |  %4.2f", lane_costs[0], lane_costs[1], lane_costs[2]);
+                fprintf(stdout,"lane costs:  %5.2f  |  %5.2f  |  %5.2f\n", lane_costs[0], lane_costs[1], lane_costs[2]);
 
-                vector<double> safety_costs = calculateSafetyCost(vehicle_map, ref_lane, ref_s, prev_size/50.0, safety_distance);
-                fprintf(stdout,"safe costs:  %4.2f  |  %4.2f  |  %4.2f", safety_costs[0], safety_costs[1], safety_costs[2]);
+                vector<double> safety_costs = calculateSafetyCost(vehicle_map, ref_lane, ref_s, prev_size/50.0, safety_distance*0.6);
+                fprintf(stdout,"safe costs:  %5.2f  |  %5.2f  |  %5.2f\n", safety_costs[0], safety_costs[1], safety_costs[2]);
 
                 int min_cost_lane = ref_lane;
                 double min_cost = numeric_limits<double>::max();
                 for(int i = 0; i < 3; ++i) {
+                    // weigh the safety cost a lot more than the fficiency cost
                     double c = lane_costs[i] + 1000 * safety_costs[i];
                     if(c < min_cost) {
                         min_cost = c;
@@ -450,6 +468,7 @@ int main() {
                     }
                 }
 
+                // change lane if there is one with a better cost
                 if(min_cost_lane != ref_lane) {
                     ref_lane = min_cost_lane;
                     cout << "changing lane to " << ref_lane << endl;
@@ -457,6 +476,14 @@ int main() {
                 cout << endl;
             }
 
+            // find the closest vehicle that gets too close to as at the current end
+            // position of the trajectory
+            // this is subject to improvement to reduce velocity oscilation by making sure
+            // that the go vehicle has the same velocity as the approached vehicle exactly when it
+            // reaches the safety_distance. this could be achieved by
+            // 1) looking ahead in time and adjust acceleration
+            // 2) recalculate the current trajectory from the start
+            // both options have advantages and idsadvantages.
             Vehicle closest_vehicle;
             auto& lane = vehicle_map.getLane(ref_lane);
             for(auto v = lane.begin(); v != lane.end(); ++v) {
@@ -467,7 +494,11 @@ int main() {
             }
 
 
-
+            // points that will be interpolated using a spline
+            // the first two points are in direction of the ego movement
+            // to allow for a smooth transition from the trajectory's end point to the
+            // new points
+            vector<double> ptsx, ptsy;
             if(prev_size < 2) {
                 double prev_car_x = car_x - cos(car_yaw);
                 double prev_car_y = car_y - sin(car_yaw);
@@ -494,7 +525,9 @@ int main() {
                 ptsy.push_back(ref_y);
             }
 
-
+            // add three points for the spline curve
+            // a distance of 30 meters guarantees, that all sample points for the trajectory will be taken from
+            // this segment. The following two points guarantee a smooth segment considering the curvature of the road
             double wp_step_size = 30.0;
             for(int i = 1; i <= 3; ++i) {
                 auto xy = getXY(ref_s + i*wp_step_size, (2 + 4 * ref_lane), map_s, map_x, map_y);
@@ -502,6 +535,7 @@ int main() {
                 ptsy.push_back(xy[1]);
             }
 
+            // transform spline points into the ego vehicle's coordinate system
             for(int i = 0; i < ptsx.size(); ++i) {
                 double shift_x = ptsx[i] - ref_x;
                 double shift_y = ptsy[i] - ref_y;
@@ -513,8 +547,8 @@ int main() {
             tk::spline wp_spline;
             wp_spline.set_points(ptsx, ptsy);
 
+            // restore trajectory from previous frame
             vector<double> next_x_vals(prev_size), next_y_vals(prev_size);
-
             std::copy(previous_path_x.begin(), previous_path_x.end(), next_x_vals.begin());
             std::copy(previous_path_y.begin(), previous_path_y.end(), next_y_vals.begin());
 
@@ -524,8 +558,13 @@ int main() {
 
             double x_add_on = 0.0;
 
+            // add new trajectory pointsuntil the path has length == horizon
             double projected_ref_s = ref_s;
             for(int i = 0; i < horizon - prev_size; ++i) {
+
+                // deaccelerate if the trajectory point gets too close to a vehicle, otherwise
+                // accelerate. We break faster than we accelerate to reduce oscillation a bit
+                // and to reduce the risk of a crash
                 if(closest_vehicle.isValid()) {
                     double rel_s = closest_vehicle.getRelativeS(projected_ref_s, (prev_size + i) / 50.0);
                     if(rel_s < safety_distance)
@@ -533,9 +572,12 @@ int main() {
                     else
                         ref_vel = std::min(ref_vel + 0.1, target_vel);
                 } else {
+                    // if there is no close vehicle we keep accelerating to the maximum target_speed
+                    // with 5 m/s²
                     ref_vel = std::min(ref_vel + 0.224, target_vel);
                 }
 
+                // calculate x and interpolate y from spline
                 double frame_vel = 0.02 * mph2ms(ref_vel);
                 projected_ref_s += frame_vel;
                 double N = target_dist / frame_vel;
