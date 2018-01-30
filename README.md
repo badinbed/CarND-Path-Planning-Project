@@ -27,7 +27,7 @@ In a last step the trajectory is extended with new points. The vehicle's velocit
 
 This requirement basically states, that the next three conditions will be held for a full round of the map. The actual challenge though is to drive without incident more than 4.32 miles. The frenet coordinates reset to 0 at the end of the loop. This affects the sensor fusion when determining whether another vehicle is too close.
 
-This problem is solved by the Vehicle class and its function ``	
+This problem is solved by the Vehicle class and its function	
 `double Vehicle::getRelativeS(double rs, secs_look_ahead) const
 `.
 It returns the relative delta S to the given reference value rs while also projecting the vehicle's current S-coori´dinate to the time of rs. It safely wraps around the reset of the waypoints.
